@@ -79,15 +79,13 @@ function stopKeepAlive(state: Runtime) {
     state.energyTimer = state.energyDeadline = undefined;
 }
 
-async function sendDP(endpoint: Zh.Endpoint, dp: number, datatype: number, data: Buffer | number[], state: Runtime) {
+async function sendEnergyRequest(endpoint: Zh.Endpoint, enabled: boolean, state: Runtime) {
     if (state.stopped) throw new Error("[ZPS-Z1] Device stopped");
-    if (dp === DP.HEARTBEAT_ENABLE) {
-        state.streamEndpoint = endpoint;
-        // A failed ACK does not prove that an attempted ON did not reach the MCU.
-        if (data[0] === 1) state.energyMayBeOn = true;
-    }
-    await tuya.sendDataPoints(endpoint, [{dp, datatype, data: Buffer.from(data)}]);
-    if (dp === DP.HEARTBEAT_ENABLE && data[0] === 0) state.energyMayBeOn = false;
+    state.streamEndpoint = endpoint;
+    // A failed ACK does not prove that an attempted ON did not reach the MCU.
+    if (enabled) state.energyMayBeOn = true;
+    await tuya.sendDataPointBool(endpoint, DP.HEARTBEAT_ENABLE, enabled);
+    if (!enabled) state.energyMayBeOn = false;
 }
 
 function shutdownRuntime(ieeeAddr: string, state: Runtime) {
@@ -164,7 +162,7 @@ function startKeepAlive(endpoint: Zh.Endpoint, state: Runtime) {
         state.energyTimer = setTimeout(async () => {
             if (!active()) return;
             // One heartbeat at a time, even when the device is slow to reply.
-            state.energyPending = sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [1], state);
+            state.energyPending = sendEnergyRequest(endpoint, true, state);
             try {
                 await state.energyPending;
             } catch (error) {
@@ -185,7 +183,7 @@ function startKeepAlive(endpoint: Zh.Endpoint, state: Runtime) {
         try {
             await enqueue(state, async () => {
                 if (state.generation !== expiredGeneration) return;
-                await sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [0], state);
+                await sendEnergyRequest(endpoint, false, state);
             });
         } catch (error) {
             logger.warning(`Energy streaming auto-off failed: ${String(error)}`, NS);
@@ -243,14 +241,15 @@ async function writeConfirmed(
     endpoint: Zh.Endpoint,
     state: Runtime,
     dp: number,
-    datatype: number,
     data: Buffer | number[],
+    send: () => Promise<unknown>,
     matches?: (data: Buffer) => boolean,
 ) {
     const expected = Buffer.from(data);
     const waiting = waitForReport(state, dp, matches || ((actual) => actual.equals(expected)));
     try {
-        await sendDP(endpoint, dp, datatype, expected, state);
+        if (state.stopped) throw new Error("[ZPS-Z1] Device stopped");
+        await send();
         await queryState(endpoint, state, true);
         await waiting.promise;
     } catch (error) {
@@ -352,17 +351,22 @@ function report(dp: number, decode: (data: Buffer) => KeyValue): Tuya.ValueConve
     };
 }
 
-function setting(dp: number, datatype: number, encode: (value: unknown) => Buffer | number[], confirmed = false): Tuya.ValueConverterSingle {
+function setting<T>(
+    dp: number,
+    send: (endpoint: Zh.Endpoint, dp: number, value: T) => Promise<unknown>,
+    validate: (value: unknown) => T,
+    confirmation?: (value: T) => Buffer | number[],
+): Tuya.ValueConverterSingle {
     return {
         to: async (value, meta) => {
-            const data = encode(value);
+            const requested = validate(value);
             const state = getRuntime(meta.device);
             const endpoint = meta.device.getEndpoint(1);
             await enqueue(state, async () => {
-                if (confirmed) {
-                    await writeConfirmed(endpoint, state, dp, datatype, data);
+                if (confirmation) {
+                    await writeConfirmed(endpoint, state, dp, confirmation(requested), () => send(endpoint, dp, requested));
                 } else {
-                    await sendDP(endpoint, dp, datatype, data, state);
+                    await send(endpoint, dp, requested);
                     await queryState(endpoint, state, true);
                 }
             });
@@ -384,7 +388,7 @@ function arraySetting(dp: number, index: number, key: string, zone = false): Tuy
                 if (zone ? (data[index] !== 0) === requested : data[index] === requested) return;
                 data[index] = zone ? (requested ? data[index] || 1 : 0) : (requested as number);
                 const matches = zone ? (actual: Buffer) => actual.every((v, i) => (v !== 0) === (data[i] !== 0)) : undefined;
-                await writeConfirmed(endpoint, state, dp, tuya.dataTypes.raw, data, matches);
+                await writeConfirmed(endpoint, state, dp, data, () => tuya.sendDataPointRaw(endpoint, dp, data), matches);
             });
         },
     };
@@ -403,13 +407,13 @@ const energyCommand: Tuya.ValueConverterSingle = {
             if (!enabled) stopKeepAlive(state);
             await state.energyPending.catch(() => {});
             try {
-                await sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [enabled ? 1 : 0], state);
+                await sendEnergyRequest(endpoint, enabled, state);
             } catch (error) {
                 // Keep the failed-ON safety OFF inside this queue entry so it cannot
                 // follow a later ON request. Stopped runtimes use lifecycle cleanup.
                 if (enabled && !state.stopped) {
                     try {
-                        await sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [0], state);
+                        await sendEnergyRequest(endpoint, false, state);
                     } catch (cleanupError) {
                         logger.warning(`Energy reporting failed-ON cleanup OFF failed: ${String(cleanupError)}`, NS);
                     }
@@ -468,38 +472,36 @@ export const zpsZ1Datapoints: Tuya.MetaTuyaDataPoints = [
         "detection_range",
         setting(
             DP.DETECTION_RANGE,
-            tuya.dataTypes.number,
-            (value) => tuya.convertDecimalValueTo4ByteHexArray(numberValue("detection_range", value, 0, 1500, 50)),
-            true,
+            tuya.sendDataPointValue,
+            (value) => numberValue("detection_range", value, 0, 1500, 50),
+            tuya.convertDecimalValueTo4ByteHexArray,
         ),
         {optimistic: false},
     ],
     [
         DP.NO_PERSON_TIME,
         "presence_clear_cooldown",
-        setting(DP.NO_PERSON_TIME, tuya.dataTypes.number, (value) =>
-            tuya.convertDecimalValueTo4ByteHexArray(numberValue("presence_clear_cooldown", value, 2, 60)),
-        ),
+        setting(DP.NO_PERSON_TIME, tuya.sendDataPointValue, (value) => numberValue("presence_clear_cooldown", value, 2, 60)),
         {optimistic: false},
     ],
     [
         DP.SENSITIVITY_PRESET,
         "sensitivity_preset",
-        setting(DP.SENSITIVITY_PRESET, tuya.dataTypes.enum, (value) => [
+        setting(DP.SENSITIVITY_PRESET, tuya.sendDataPointEnum, (value) =>
             enumValue("sensitivity_preset", value, {high: 0, medium: 1, low: 2, custom: 3}),
-        ]),
+        ),
         {optimistic: false},
     ],
     [
         DP.AI_SELF_LEARNING,
         "auto_calibration",
-        setting(DP.AI_SELF_LEARNING, tuya.dataTypes.enum, (value) => [enumValue("auto_calibration", value, {start: 1, cancel: 5})]),
+        setting(DP.AI_SELF_LEARNING, tuya.sendDataPointEnum, (value) => enumValue("auto_calibration", value, {start: 1, cancel: 5})),
         {optimistic: false},
     ],
     [
         DP.INDICATOR,
         "led_indicator",
-        setting(DP.INDICATOR, tuya.dataTypes.bool, (value) => [booleanValue("led_indicator", value) ? 1 : 0]),
+        setting(DP.INDICATOR, tuya.sendDataPointBool, (value) => booleanValue("led_indicator", value)),
         {optimistic: false},
     ],
     [DP.HEARTBEAT_ENABLE, "energy_streaming", energyCommand, {optimistic: false}],
