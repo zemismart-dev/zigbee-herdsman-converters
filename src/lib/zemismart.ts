@@ -46,7 +46,6 @@ const DP = {
     INDICATOR: 123,
     ENERGY_THRESHOLD: 124,
 };
-const DT = {RAW: 0, BOOL: 1, VALUE: 2, ENUM: 4};
 const ZONE_COUNT = 10;
 const REPORT_TIMEOUT_MS = 10000;
 const QUERY_INTERVAL_MS = 3000;
@@ -80,26 +79,6 @@ function stopKeepAlive(state: Runtime) {
     state.energyTimer = state.energyDeadline = undefined;
 }
 
-async function sendFrame(endpoint: Zh.Endpoint, dp: number, datatype: number, data: Buffer | number[]) {
-    const buffer = Buffer.from(data);
-    switch (datatype) {
-        case DT.BOOL:
-            await tuya.sendDataPointBool(endpoint, dp, buffer[0] === 1);
-            break;
-        case DT.ENUM:
-            await tuya.sendDataPointEnum(endpoint, dp, buffer[0]);
-            break;
-        case DT.VALUE:
-            await tuya.sendDataPointValue(endpoint, dp, buffer.readUInt32BE(0));
-            break;
-        case DT.RAW:
-            await tuya.sendDataPointRaw(endpoint, dp, buffer);
-            break;
-        default:
-            throw new Error(`[ZPS-Z1] Unsupported datatype: ${datatype}`);
-    }
-}
-
 async function sendDP(endpoint: Zh.Endpoint, dp: number, datatype: number, data: Buffer | number[], state: Runtime) {
     if (state.stopped) throw new Error("[ZPS-Z1] Device stopped");
     if (dp === DP.HEARTBEAT_ENABLE) {
@@ -107,7 +86,7 @@ async function sendDP(endpoint: Zh.Endpoint, dp: number, datatype: number, data:
         // A failed ACK does not prove that an attempted ON did not reach the MCU.
         if (data[0] === 1) state.energyMayBeOn = true;
     }
-    await sendFrame(endpoint, dp, datatype, data);
+    await tuya.sendDataPoints(endpoint, [{dp, datatype, data: Buffer.from(data)}]);
     if (dp === DP.HEARTBEAT_ENABLE && data[0] === 0) state.energyMayBeOn = false;
 }
 
@@ -124,7 +103,7 @@ function shutdownRuntime(ieeeAddr: string, state: Runtime) {
         await Promise.allSettled([previous, state.queue, state.energyPending]);
         if (state.energyMayBeOn && state.streamEndpoint) {
             try {
-                await sendFrame(state.streamEndpoint, DP.HEARTBEAT_ENABLE, DT.BOOL, [0]);
+                await tuya.sendDataPointBool(state.streamEndpoint, DP.HEARTBEAT_ENABLE, false);
                 state.energyMayBeOn = false;
             } catch (error) {
                 logger.warning(`Energy reporting shutdown OFF failed: ${String(error)}`, NS);
@@ -185,7 +164,7 @@ function startKeepAlive(endpoint: Zh.Endpoint, state: Runtime) {
         state.energyTimer = setTimeout(async () => {
             if (!active()) return;
             // One heartbeat at a time, even when the device is slow to reply.
-            state.energyPending = sendDP(endpoint, DP.HEARTBEAT_ENABLE, DT.BOOL, [1], state);
+            state.energyPending = sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [1], state);
             try {
                 await state.energyPending;
             } catch (error) {
@@ -206,7 +185,7 @@ function startKeepAlive(endpoint: Zh.Endpoint, state: Runtime) {
         try {
             await enqueue(state, async () => {
                 if (state.generation !== expiredGeneration) return;
-                await sendDP(endpoint, DP.HEARTBEAT_ENABLE, DT.BOOL, [0], state);
+                await sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [0], state);
             });
         } catch (error) {
             logger.warning(`Energy streaming auto-off failed: ${String(error)}`, NS);
@@ -307,24 +286,18 @@ function enumValue(key: string, value: unknown, choices: Record<string, number>)
     return choices[value];
 }
 
-function uint32(value: number) {
-    const data = Buffer.alloc(4);
-    data.writeUInt32BE(value);
-    return data;
-}
-
 const reportFormats = new Map<number, [number, number, number[]?]>([
-    [DP.PRESENCE_STATE, [DT.ENUM, 1, [0, 1, 2]]],
-    [DP.DETECTION_RANGE, [DT.VALUE, 4]],
-    [DP.ILLUMINANCE, [DT.VALUE, 4]],
-    [DP.ENERGY_VALUE, [DT.RAW, 20]],
-    [DP.AI_SELF_LEARNING, [DT.ENUM, 1, [0, 1, 2, 3, 4, 5]]],
-    [DP.HEARTBEAT_ENABLE, [DT.BOOL, 1, [0, 1]]],
-    [DP.SENSITIVITY_PRESET, [DT.ENUM, 1, [0, 1, 2, 3]]],
-    [DP.ZONE_MAP, [DT.RAW, 10]],
-    [DP.NO_PERSON_TIME, [DT.VALUE, 4]],
-    [DP.INDICATOR, [DT.BOOL, 1, [0, 1]]],
-    [DP.ENERGY_THRESHOLD, [DT.RAW, 20]],
+    [DP.PRESENCE_STATE, [tuya.dataTypes.enum, 1, [0, 1, 2]]],
+    [DP.DETECTION_RANGE, [tuya.dataTypes.number, 4]],
+    [DP.ILLUMINANCE, [tuya.dataTypes.number, 4]],
+    [DP.ENERGY_VALUE, [tuya.dataTypes.raw, 20]],
+    [DP.AI_SELF_LEARNING, [tuya.dataTypes.enum, 1, [0, 1, 2, 3, 4, 5]]],
+    [DP.HEARTBEAT_ENABLE, [tuya.dataTypes.bool, 1, [0, 1]]],
+    [DP.SENSITIVITY_PRESET, [tuya.dataTypes.enum, 1, [0, 1, 2, 3]]],
+    [DP.ZONE_MAP, [tuya.dataTypes.raw, 10]],
+    [DP.NO_PERSON_TIME, [tuya.dataTypes.number, 4]],
+    [DP.INDICATOR, [tuya.dataTypes.bool, 1, [0, 1]]],
+    [DP.ENERGY_THRESHOLD, [tuya.dataTypes.raw, 20]],
 ]);
 
 function validatedData(dpv: Tuya.DpValue) {
@@ -357,13 +330,13 @@ function report(dp: number, decode: (data: Buffer) => KeyValue): Tuya.ValueConve
                 const data = validatedData(candidate);
                 if (!data) return false;
                 switch (candidate.datatype) {
-                    case DT.RAW:
+                    case tuya.dataTypes.raw:
                         return candidate.data === value;
-                    case DT.BOOL:
+                    case tuya.dataTypes.bool:
                         return (data[0] === 1) === value;
-                    case DT.ENUM:
+                    case tuya.dataTypes.enum:
                         return data[0] === value;
-                    case DT.VALUE:
+                    case tuya.dataTypes.number:
                         return tuya.convertBufferToNumber(data) === value;
                 }
                 return false;
@@ -411,7 +384,7 @@ function arraySetting(dp: number, index: number, key: string, zone = false): Tuy
                 if (zone ? (data[index] !== 0) === requested : data[index] === requested) return;
                 data[index] = zone ? (requested ? data[index] || 1 : 0) : (requested as number);
                 const matches = zone ? (actual: Buffer) => actual.every((v, i) => (v !== 0) === (data[i] !== 0)) : undefined;
-                await writeConfirmed(endpoint, state, dp, DT.RAW, data, matches);
+                await writeConfirmed(endpoint, state, dp, tuya.dataTypes.raw, data, matches);
             });
         },
     };
@@ -430,13 +403,13 @@ const energyCommand: Tuya.ValueConverterSingle = {
             if (!enabled) stopKeepAlive(state);
             await state.energyPending.catch(() => {});
             try {
-                await sendDP(endpoint, DP.HEARTBEAT_ENABLE, DT.BOOL, [enabled ? 1 : 0], state);
+                await sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [enabled ? 1 : 0], state);
             } catch (error) {
                 // Keep the failed-ON safety OFF inside this queue entry so it cannot
                 // follow a later ON request. Stopped runtimes use lifecycle cleanup.
                 if (enabled && !state.stopped) {
                     try {
-                        await sendDP(endpoint, DP.HEARTBEAT_ENABLE, DT.BOOL, [0], state);
+                        await sendDP(endpoint, DP.HEARTBEAT_ENABLE, tuya.dataTypes.bool, [0], state);
                     } catch (cleanupError) {
                         logger.warning(`Energy reporting failed-ON cleanup OFF failed: ${String(cleanupError)}`, NS);
                     }
@@ -493,28 +466,42 @@ export const zpsZ1Datapoints: Tuya.MetaTuyaDataPoints = [
     [
         DP.DETECTION_RANGE,
         "detection_range",
-        setting(DP.DETECTION_RANGE, DT.VALUE, (value) => uint32(numberValue("detection_range", value, 0, 1500, 50)), true),
+        setting(
+            DP.DETECTION_RANGE,
+            tuya.dataTypes.number,
+            (value) => tuya.convertDecimalValueTo4ByteHexArray(numberValue("detection_range", value, 0, 1500, 50)),
+            true,
+        ),
         {optimistic: false},
     ],
     [
         DP.NO_PERSON_TIME,
         "presence_clear_cooldown",
-        setting(DP.NO_PERSON_TIME, DT.VALUE, (value) => uint32(numberValue("presence_clear_cooldown", value, 2, 60))),
+        setting(DP.NO_PERSON_TIME, tuya.dataTypes.number, (value) =>
+            tuya.convertDecimalValueTo4ByteHexArray(numberValue("presence_clear_cooldown", value, 2, 60)),
+        ),
         {optimistic: false},
     ],
     [
         DP.SENSITIVITY_PRESET,
         "sensitivity_preset",
-        setting(DP.SENSITIVITY_PRESET, DT.ENUM, (value) => [enumValue("sensitivity_preset", value, {high: 0, medium: 1, low: 2, custom: 3})]),
+        setting(DP.SENSITIVITY_PRESET, tuya.dataTypes.enum, (value) => [
+            enumValue("sensitivity_preset", value, {high: 0, medium: 1, low: 2, custom: 3}),
+        ]),
         {optimistic: false},
     ],
     [
         DP.AI_SELF_LEARNING,
         "auto_calibration",
-        setting(DP.AI_SELF_LEARNING, DT.ENUM, (value) => [enumValue("auto_calibration", value, {start: 1, cancel: 5})]),
+        setting(DP.AI_SELF_LEARNING, tuya.dataTypes.enum, (value) => [enumValue("auto_calibration", value, {start: 1, cancel: 5})]),
         {optimistic: false},
     ],
-    [DP.INDICATOR, "led_indicator", setting(DP.INDICATOR, DT.BOOL, (value) => [booleanValue("led_indicator", value) ? 1 : 0]), {optimistic: false}],
+    [
+        DP.INDICATOR,
+        "led_indicator",
+        setting(DP.INDICATOR, tuya.dataTypes.bool, (value) => [booleanValue("led_indicator", value) ? 1 : 0]),
+        {optimistic: false},
+    ],
     [DP.HEARTBEAT_ENABLE, "energy_streaming", energyCommand, {optimistic: false}],
     ...Array.from(
         {length: ZONE_COUNT},
